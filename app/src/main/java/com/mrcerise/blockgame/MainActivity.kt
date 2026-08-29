@@ -1,4 +1,4 @@
-package com.blockblast.game
+package com.mrcerise.blockgame
 
 import android.app.Activity
 import android.app.AlertDialog

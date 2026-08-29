@@ -1,4 +1,4 @@
-package com.blockblast.game
+package com.mrcerise.blockgame
 
 import kotlin.math.max
 import kotlin.random.Random

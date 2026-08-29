@@ -1,4 +1,4 @@
-package com.blockblast.game
+package com.mrcerise.blockgame
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

@@ -1,4 +1,4 @@
-package com.blockblast.game
+package com.mrcerise.blockgame
 
 import android.media.AudioAttributes
 import android.media.AudioFormat

@@ -55,7 +55,9 @@ class GameView @JvmOverloads constructor(
     private val btnPlayAgain = RectF()
     private val btnRestart = RectF()
     private val switchRect = RectF()
+    private val fpsSwitchRect = RectF()
     private val closeRect = RectF()
+    private val cardRect = RectF()
 
     // ---------------- drag state ----------------
     private var dragSlot = -1
@@ -80,9 +82,27 @@ class GameView @JvmOverloads constructor(
     private val trayBorn = LongArray(3)
     private var shakeStart = -1L
     private var gameOverAt = -1L
+    private var comboPulseAt = -1L
 
     private var showSettings = false
     private var showGameOver = false
+    private var gearPressed = false
+
+    /**
+     * When on, the app asks the compositor for the display's fastest mode. Android
+     * presents at vsync, so the panel's refresh rate is a hard ceiling -- this lifts the
+     * app from whatever the system picked (often 60Hz) to the panel's maximum.
+     */
+    var maxFps = false
+        private set
+
+    /** Set by the host activity so a settings change can be applied to the window. */
+    var onDisplayPrefsChanged: (() -> Unit)? = null
+
+    // measured frame rate, shown only while maxFps is on
+    private var fpsWindowStart = 0L
+    private var fpsFrames = 0
+    private var fpsValue = 0f
 
     // ---------------- paints ----------------
     private val pBlock = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -139,9 +159,15 @@ class GameView @JvmOverloads constructor(
 
     init {
         sound.enabled = prefs.getBoolean("sound_on", true)
+        maxFps = prefs.getBoolean("max_fps", false)
         game.best = prefs.getInt("best", 0)
         loadGame()
-        if (game.tray.all { it == null }) game.refillTray()
+        // Derive "is this game finished" from the board actually restored, rather than
+        // from the flag Game.init computed on an empty board. saveGame() persisted
+        // `over`, but nothing ever read it back, so a finished game came back looking
+        // playable: no overlay, no PLAY AGAIN, and no legal move.
+        if (game.tray.all { it == null }) game.refillTray()   // recomputes `over` itself
+        else game.over = !game.anyMovePossible()
         val now = SystemClock.uptimeMillis()
         for (i in 0..2) {
             if (game.tray[i] != null && trayBorn[i] == 0L) trayBorn[i] = now + i * 90L
@@ -233,16 +259,31 @@ class GameView @JvmOverloads constructor(
 
     // ============================================================ draw
     override fun onDraw(canvas: Canvas) {
-        val now = SystemClock.uptimeMillis()
+        // Frame time, not wall time. SystemClock.uptimeMillis() sampled here drifts by
+        // however long the frame took to start, so time-driven animations judder even at
+        // a solid 60fps. drawingTime is the Choreographer's vsync-aligned frame time
+        // (same uptimeMillis base as the timestamps the touch handlers record).
+        val frame = drawingTime
+        val now = if (frame > 0L) frame else SystemClock.uptimeMillis()
+        if (maxFps) sampleFps(now)
         drawBackground(canvas)
         drawTopBar(canvas)
         drawScore(canvas)
+        drawComboMeter(canvas, now)
 
         // shake
         var shakeX = 0f
         if (shakeStart > 0) {
-            val t = (now - shakeStart) / 400f
-            if (t < 1f) shakeX = sin(t * 28f) * dp(8f) * (1f - t) else shakeStart = -1
+            // the vsync frame time can sit just before a touch timestamp recorded in the
+            // same frame, so clamp rather than letting the decay term exceed 1
+            val t = ((now - shakeStart) / 400f).coerceAtLeast(0f)
+            // 28 rad over 400ms is ~4.5 cycles -- barely 5 frames per cycle at 60fps, so
+            // it aliased into a judder instead of reading as a shake. ~3 cycles samples
+            // cleanly, and a squared falloff settles more softly.
+            if (t < 1f) {
+                val decay = (1f - t) * (1f - t)
+                shakeX = sin(t * 19f) * dp(8f) * decay
+            } else shakeStart = -1
         }
         canvas.save()
         canvas.translate(shakeX, 0f)
@@ -281,9 +322,27 @@ class GameView @JvmOverloads constructor(
         scheduleNextFrame(now)
     }
 
+    /** Rolling frame-rate estimate over the frames actually drawn. */
+    private fun sampleFps(now: Long) {
+        val elapsed = now - fpsWindowStart
+        if (fpsWindowStart == 0L || elapsed > 1000L) {
+            // first frame, or the loop went idle -- start a fresh window
+            fpsWindowStart = now
+            fpsFrames = 0
+            return
+        }
+        fpsFrames++
+        if (elapsed >= 500L) {
+            fpsValue = fpsFrames * 1000f / elapsed
+            fpsWindowStart = now
+            fpsFrames = 0
+        }
+    }
+
     private fun scheduleNextFrame(now: Long) {
         val busy = dragSlot >= 0 || clearAnim != null || popAnim != null ||
             floaters.isNotEmpty() || shakeStart > 0 || gameOverAt > now ||
+            (comboPulseAt > 0 && now - comboPulseAt < COMBO_PULSE_MS) ||
             trayBorn.any { it > now - 400 }
         if (busy) postInvalidateOnAnimation()
     }
@@ -372,6 +431,58 @@ class GameView @JvmOverloads constructor(
         pText.clearShadowLayer()
     }
 
+    /**
+     * Persistent combo readout: how long the current chain is, and how many dry moves it
+     * can still absorb before it breaks.
+     */
+    private fun drawComboMeter(canvas: Canvas, now: Long) {
+        val streak = game.streak
+        if (streak < 2) return
+
+        // sit in the gap between the top bar and the score
+        val gapTop = paddingTop + dp(56f)
+        val gapBottom = boardTop - dp(20f) - cell * 1.05f
+        val cy = if (gapBottom - gapTop > dp(34f)) (gapTop + gapBottom) / 2f else gapTop + dp(18f)
+        val cx = width / 2f
+
+        val pulse = if (comboPulseAt > 0) ((now - comboPulseAt) / COMBO_PULSE_MS.toFloat())
+            .coerceIn(0f, 1f) else 1f
+        val bump = if (pulse < 1f) 1f + 0.30f * (1f - pulse) * (1f - pulse) else 1f
+
+        val w = dp(150f); val h = dp(30f)
+        canvas.save()
+        canvas.scale(bump, bump, cx, cy)
+
+        // the chain runs hotter as it grows
+        pFill.shader = null
+        pFill.color = when {
+            streak >= 8 -> Color.rgb(0xFF, 0x5E, 0x3C)
+            streak >= 5 -> Color.rgb(0xFF, 0x92, 0x2E)
+            else -> Color.rgb(0xF7, 0xB4, 0x3C)
+        }
+        tmpRect.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
+        canvas.drawRoundRect(tmpRect, h / 2f, h / 2f, pFill)
+
+        pText.textSize = dp(15f)
+        pText.typeface = fontBold
+        pText.color = Color.rgb(0x4A, 0x27, 0x10)
+        canvas.drawText("COMBO x" + streak, cx, cy + dp(5f), pText)
+
+        // draining grace bar, just under the pill
+        val frac = game.chainGrace.toFloat() / Game.CHAIN_GRACE_MOVES.toFloat()
+        val bw = w * 0.72f
+        val by = cy + h / 2f + dp(4f)
+        pFill.color = 0x55000000
+        tmpRect.set(cx - bw / 2f, by, cx + bw / 2f, by + dp(4f))
+        canvas.drawRoundRect(tmpRect, dp(2f), dp(2f), pFill)
+        if (frac > 0f) {
+            pFill.color = Color.rgb(0xFF, 0xF0, 0xD0)
+            tmpRect.set(cx - bw / 2f, by, cx - bw / 2f + bw * frac, by + dp(4f))
+            canvas.drawRoundRect(tmpRect, dp(2f), dp(2f), pFill)
+        }
+        canvas.restore()
+    }
+
     private fun drawBoard(canvas: Canvas, now: Long) {
         // frame shadow + frame
         pFill.color = 0x55000000
@@ -431,7 +542,7 @@ class GameView @JvmOverloads constructor(
                 tmpRect.set(x, y, x + cell, y + cell)
                 canvas.drawRoundRect(tmpRect, cell * 0.14f, cell * 0.14f, pFill)
             } else {
-                val s = (1f - (tClear - 150f) / 270f).coerceIn(0f, 1f)
+                val s = 1f - smooth(((tClear - 150f) / 270f).coerceIn(0f, 1f))
                 val d = cell * (1f - s) / 2f
                 drawBlock(canvas, x + d, y + d, cell * s, 0, 255)
             }
@@ -450,6 +561,12 @@ class GameView @JvmOverloads constructor(
             }
         }
     }
+
+    /** Smooth acceleration then deceleration across 0..1. */
+    private fun smooth(t: Float): Float = t * t * (3f - 2f * t)
+
+    /** Quick start, gentle finish. */
+    private fun easeOut(t: Float): Float = 1f - (1f - t) * (1f - t)
 
     private fun popScale(t: Float): Float =
         if (t < 0.7f) {
@@ -519,8 +636,9 @@ class GameView @JvmOverloads constructor(
             val f = it.next()
             val t = (now - f.start) / 900f
             if (t >= 1f) { it.remove(); continue }
-            val alpha = (if (t < 0.15f) t / 0.15f else 1f - (t - 0.15f) / 0.85f).coerceIn(0f, 1f)
-            val rise = t * dp(34f)
+            val alpha = (if (t < 0.15f) t / 0.15f
+                else 1f - smooth((t - 0.15f) / 0.85f)).coerceIn(0f, 1f)
+            val rise = easeOut(t) * dp(38f)
             pText.textSize = if (f.big) cell * 0.62f else cell * 0.42f
             pText.typeface = fontBold
             pText.color = if (f.gold) Color.argb((alpha * 255).toInt(), 0xFF, 0xD3, 0x7A)
@@ -671,11 +789,10 @@ class GameView @JvmOverloads constructor(
 
     private fun drawGameOver(canvas: Canvas) {
         dimBackground(canvas)
-        val cw = boardSize * 0.82f
-        val ch = dp(330f)
-        val cx = width / 2f
-        val cy = boardTop + boardSize / 2f
-        val card = RectF(cx - cw / 2f, cy - ch / 2f, cx + cw / 2f, cy + ch / 2f)
+        gameOverCard(cardRect)
+        val card = cardRect
+        val cw = card.width()
+        val cx = card.centerX()
         drawCard(canvas, card)
 
         pText.textSize = dp(26f)
@@ -710,13 +827,35 @@ class GameView @JvmOverloads constructor(
         canvas.drawText("PLAY AGAIN", cx, btnPlayAgain.centerY() + dp(7f), pText)
     }
 
+    /** One labelled toggle row; [out] receives the switch's hit rect. */
+    private fun drawToggleRow(
+        canvas: Canvas, card: RectF, y: Float, label: String, on: Boolean, out: RectF
+    ) {
+        pText.textAlign = Paint.Align.LEFT
+        pText.textSize = dp(18f)
+        pText.typeface = fontNormal
+        pText.color = Color.rgb(0xFF, 0xF0, 0xDE)
+        canvas.drawText(label, card.left + dp(28f), y + dp(7f), pText)
+        pText.textAlign = Paint.Align.CENTER
+
+        val sw = dp(54f); val shh = dp(30f)
+        out.set(card.right - dp(28f) - sw, y - shh / 2f, card.right - dp(28f), y + shh / 2f)
+        pFill.shader = null
+        pFill.color = if (on) Color.rgb(0xF0, 0xB7, 0x5E) else Color.rgb(0x6B, 0x47, 0x30)
+        canvas.drawRoundRect(out, shh / 2f, shh / 2f, pFill)
+        pFill.color = Color.WHITE
+        canvas.drawCircle(
+            if (on) out.right - shh / 2f else out.left + shh / 2f,
+            out.centerY(), shh / 2f - dp(3f), pFill
+        )
+    }
+
     private fun drawSettings(canvas: Canvas) {
         dimBackground(canvas)
-        val cw = boardSize * 0.8f
-        val ch = dp(250f)
-        val cx = width / 2f
-        val cy = boardTop + boardSize / 2f
-        val card = RectF(cx - cw / 2f, cy - ch / 2f, cx + cw / 2f, cy + ch / 2f)
+        settingsCard(cardRect)
+        val card = cardRect
+        val cw = card.width()
+        val cx = card.centerX()
         drawCard(canvas, card)
 
         pText.textSize = dp(23f)
@@ -730,22 +869,19 @@ class GameView @JvmOverloads constructor(
         pText.color = Color.rgb(0xFF, 0xE8, 0xCE)
         canvas.drawText("×", closeRect.centerX(), closeRect.centerY() + dp(8f), pText)
 
-        // sound row
-        val rowY = card.top + dp(92f)
-        pText.textAlign = Paint.Align.LEFT
-        pText.textSize = dp(18f)
-        pText.typeface = fontNormal
-        pText.color = Color.rgb(0xFF, 0xF0, 0xDE)
-        canvas.drawText("Sound", card.left + dp(28f), rowY + dp(7f), pText)
-        pText.textAlign = Paint.Align.CENTER
+        drawToggleRow(canvas, card, card.top + dp(94f), "Sound", sound.enabled, switchRect)
+        drawToggleRow(canvas, card, card.top + dp(150f), "Max FPS", maxFps, fpsSwitchRect)
 
-        val sw = dp(54f); val shh = dp(30f)
-        switchRect.set(card.right - dp(28f) - sw, rowY - shh / 2f, card.right - dp(28f), rowY + shh / 2f)
-        pFill.color = if (sound.enabled) Color.rgb(0xF0, 0xB7, 0x5E) else Color.rgb(0x6B, 0x47, 0x30)
-        canvas.drawRoundRect(switchRect, shh / 2f, shh / 2f, pFill)
-        val knobX = if (sound.enabled) switchRect.right - shh / 2f else switchRect.left + shh / 2f
-        pFill.color = Color.WHITE
-        canvas.drawCircle(knobX, switchRect.centerY(), shh / 2f - dp(3f), pFill)
+        // caption under the FPS row: what it is actually doing right now
+        pText.textAlign = Paint.Align.LEFT
+        pText.textSize = dp(11f)
+        pText.typeface = fontNormal
+        pText.color = Color.argb(170, 0xFF, 0xE8, 0xCE)
+        val caption = if (!maxFps) "Uses the system default refresh rate"
+            else if (fpsValue > 0f) "Running at %.0f fps".format(fpsValue)
+            else "Requesting the display's fastest mode"
+        canvas.drawText(caption, card.left + dp(28f), card.top + dp(176f), pText)
+        pText.textAlign = Paint.Align.CENTER
 
         // restart button
         val bw = cw * 0.66f; val bh = dp(48f)
@@ -769,9 +905,11 @@ class GameView @JvmOverloads constructor(
                 if (showGameOver) return true
                 if (showSettings) return true
                 if (gearRect.contains(x, y)) {
-                    showSettings = true
-                    sound.click()
-                    invalidate()
+                    // Open on ACTION_UP, like every other button here. Opening on DOWN
+                    // meant this same gesture's UP landed outside the settings card and
+                    // was treated as a tap-outside dismiss, so the panel stayed up only
+                    // while the finger was held down.
+                    gearPressed = true
                     return true
                 }
                 // tray hit test (whole slot is a generous touch target)
@@ -795,6 +933,15 @@ class GameView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_UP -> {
+                if (gearPressed) {
+                    gearPressed = false
+                    if (gearRect.contains(x, y)) {
+                        showSettings = true
+                        sound.click()
+                    }
+                    invalidate()
+                    return true
+                }
                 if (showGameOver) {
                     if (btnPlayAgain.contains(x, y)) { sound.click(); restart() }
                     // only the PLAY AGAIN button dismisses the game-over screen
@@ -808,6 +955,12 @@ class GameView @JvmOverloads constructor(
                         sound.enabled = !sound.enabled
                         prefs.edit().putBoolean("sound_on", sound.enabled).apply()
                         sound.click()
+                    } else if (fpsSwitchRect.contains(x, y)) {
+                        maxFps = !maxFps
+                        prefs.edit().putBoolean("max_fps", maxFps).apply()
+                        fpsValue = 0f; fpsWindowStart = 0L; fpsFrames = 0
+                        sound.click()
+                        onDisplayPrefsChanged?.invoke()
                     } else if (btnRestart.contains(x, y)) {
                         sound.click()
                         showSettings = false
@@ -835,6 +988,7 @@ class GameView @JvmOverloads constructor(
                 return true
             }
             MotionEvent.ACTION_CANCEL -> {
+                gearPressed = false
                 dragSlot = -1; dragShape = null; anchorRow = -1; dragOverBoard = false
                 invalidate()
                 return true
@@ -843,12 +997,21 @@ class GameView @JvmOverloads constructor(
         return super.onTouchEvent(event)
     }
 
+    // Card bounds live in one place so drawing and hit testing can never drift apart.
+    private fun settingsCard(out: RectF) = cardBounds(out, 0.80f, dp(302f))
+    private fun gameOverCard(out: RectF) = cardBounds(out, 0.82f, dp(330f))
+
+    private fun cardBounds(out: RectF, widthFactor: Float, h: Float) {
+        val w = boardSize * widthFactor
+        val cx = width / 2f
+        val cy = boardTop + boardSize / 2f
+        out.set(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
+    }
+
     private fun pointInCard(x: Float, y: Float, settings: Boolean): Boolean {
-        // rough card bounds mirror draw methods
-        val cw = boardSize * if (settings) 0.8f else 0.82f
-        val ch = if (settings) dp(250f) else dp(330f)
-        val cx = width / 2f; val cy = boardTop + boardSize / 2f
-        return x in (cx - cw / 2f)..(cx + cw / 2f) && y in (cy - ch / 2f)..(cy + ch / 2f)
+        if (settings) settingsCard(cardRect) else gameOverCard(cardRect)
+        return x >= cardRect.left && x <= cardRect.right &&
+            y >= cardRect.top && y <= cardRect.bottom
     }
 
     private fun slotAt(x: Float, y: Float): Int {
@@ -890,7 +1053,9 @@ class GameView @JvmOverloads constructor(
     private fun placePiece(r: Int, c: Int) {
         val slot = dragSlot
         val shape = dragShape ?: return
-        val before = game.tray.map { it != null }
+        // snapshot the actual pieces, not just "was occupied" -- see the refill note below
+        val before = arrayOfNulls<PieceShape>(3)
+        for (i in 0..2) before[i] = game.tray[i]
         val result = game.place(slot, r, c)
         if (!result.placed) {
             dragSlot = -1; dragShape = null
@@ -911,20 +1076,32 @@ class GameView @JvmOverloads constructor(
             val centerX = width / 2f
             val centerY = boardTop + boardSize / 2f
             floaters.add(Floater("+${result.gained}", centerX, centerY - cell * 0.6f, false, false, now + 200))
-            val praise = when (result.clearedLines) {
-                2 -> "GOOD!"
-                3 -> "GREAT!"
-                4 -> "EXCELLENT!"
-                else -> "UNBELIEVABLE!"
+            // clearedLines == 1 used to fall through to "UNBELIEVABLE!"
+            val praise = when {
+                result.clearedLines >= 5 -> "UNBELIEVABLE!"
+                result.clearedLines == 4 -> "EXCELLENT!"
+                result.clearedLines == 3 -> "GREAT!"
+                result.clearedLines == 2 -> "GOOD!"
+                result.streak >= 5 -> "ON FIRE!"
+                result.streak >= 3 -> "COMBO!"
+                else -> "NICE!"
             }
             floaters.add(Floater(praise, centerX, centerY + cell * 0.2f, true, true, now + 200))
             if (result.streak >= 2) {
-                floaters.add(Floater("COMBO x${result.streak}", centerX, centerY + cell * 0.95f, false, true, now + 200))
+                floaters.add(Floater("COMBO x${result.streak}", centerX, centerY + cell * 0.95f, true, true, now + 200))
+                comboPulseAt = now
+                // a long chain or a big multi-clear gets a kick
+                if (result.streak >= 3 || result.clearedLines >= 3) shakeStart = now
             }
         }
-        // refilled slots animate in
+        // Refilled slots animate in. The slot just played counts too: placing the last
+        // piece refills all three, and keying off "was this slot occupied" skipped the
+        // one you had just emptied, so its replacement popped in with no animation while
+        // the other two slid in.
         for (i in 0..2) {
-            if (!before[i] && game.tray[i] != null) trayBorn[i] = now + 250 + i * 90L
+            if (game.tray[i] != null && (before[i] == null || i == slot)) {
+                trayBorn[i] = now + 250 + i * 90L
+            }
         }
         saveGame()
         if (game.over && clearAnim == null && gameOverAt < 0) {
@@ -940,6 +1117,7 @@ class GameView @JvmOverloads constructor(
         showGameOver = false
         showSettings = false
         shakeStart = -1
+        comboPulseAt = -1L
         val now = SystemClock.uptimeMillis()
         for (i in 0..2) trayBorn[i] = now + i * 90L
         saveGame()
@@ -957,16 +1135,21 @@ class GameView @JvmOverloads constructor(
     private companion object {
         /** Blocks render a thin lip below the body: total height is size * BLOCK_EDGE. */
         const val BLOCK_EDGE = 1.06f
+
+        /** How long the combo meter's pop lasts, in ms. */
+        const val COMBO_PULSE_MS = 340L
     }
 
     // ============================================================ persistence
+    // NB: `over` is intentionally not persisted. It is fully derivable from the grid and
+    // tray, and storing it separately is what let the two disagree: the flag was written
+    // but never read back, so a finished game reloaded as playable.
     private fun saveGame() {
         prefs.edit()
             .putInt("best", game.best)
             .putInt("score", game.score)
             .putString("grid", game.serializeGrid())
             .putString("tray", game.serializeTray())
-            .putBoolean("over", game.over)
             .apply()
     }
 
@@ -979,11 +1162,9 @@ class GameView @JvmOverloads constructor(
             // existing pieces shouldn't play the entrance animation
             val old = SystemClock.uptimeMillis() - 10000L
             for (i in 0..2) if (game.tray[i] != null) trayBorn[i] = old
-            if (game.over) {
-                // leave the saved game-over state as-is
-                return
-            }
             game.best = maxOf(game.best, game.score)
+            // NB: `over` is deliberately not decided here -- the tray may still be empty
+            // and about to be refilled. init() recomputes it once the tray is settled.
         } catch (_: Throwable) {
         }
     }

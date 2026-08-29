@@ -1,6 +1,7 @@
 package com.mrcerise.blockgame
 
 import android.content.Context
+import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.LinearGradient
@@ -18,6 +19,7 @@ import android.view.MotionEvent
 import android.view.View
 import android.view.WindowInsets
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.sin
 
 class GameView @JvmOverloads constructor(
@@ -99,6 +101,42 @@ class GameView @JvmOverloads constructor(
     private val fontBold = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
     private val fontNormal = Typeface.create(Typeface.DEFAULT, Typeface.NORMAL)
 
+    // ---------------- cached art ----------------
+    // Everything below exists so that onDraw allocates (almost) nothing. Constructing a
+    // LinearGradient/RadialGradient allocates a native Skia shader, and the previous code
+    // built ~170 of them per frame.
+
+    private var bgFill: LinearGradient? = null
+    private var bgVignette: RadialGradient? = null
+    private var bgW = 0
+    private var bgH = 0
+
+    // top-bar gradients, rebuilt only when the bar geometry actually changes
+    private var topBarKey = Int.MIN_VALUE
+    private var shCrown: LinearGradient? = null
+    private var shGear: LinearGradient? = null
+    private var shPill: LinearGradient? = null
+
+    /** Gold (0) and dimmed (3) blocks pre-rendered once, then blitted at any size. */
+    private val blockArt = arrayOfNulls<Bitmap>(4)
+    private val blockArtRatio = FloatArray(4)
+    private var blockArtSize = 0
+    private val pBitmap = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+
+    // scratch objects reused every frame instead of allocating
+    private val tmpRect = RectF()
+    private val blockRect = RectF()
+    private val scratchPath = Path()
+
+    // O(1) per-cell lookups instead of scanning the clear/pop cell lists 64x per frame
+    private val clearMask = Array(8) { BooleanArray(8) }
+    private val popMask = Array(8) { BooleanArray(8) }
+
+    // "does this tray piece still fit anywhere" — an 8x8 scan per piece, so it is cached
+    // and recomputed only when the game state actually changes
+    private val trayFits = BooleanArray(3)
+    private var trayFitsVersion = -1
+
     init {
         sound.enabled = prefs.getBoolean("sound_on", true)
         game.best = prefs.getInt("best", 0)
@@ -144,16 +182,54 @@ class GameView @JvmOverloads constructor(
         trayGap = trayCell * 0.08f
         trayCenterY = contentTop + contentH * 0.78f
         for (i in 0..2) slotCenterX[i] = boardLeft + boardSize * (i + 0.5f) / 3f
+
+        buildBlockArt()
     }
 
-    private fun cellOrigin(row: Int, col: Int): Pair<Float, Float> =
-        Pair(boardLeft + boardPad + col * (cell + gap), boardTop + boardPad + row * (cell + gap))
-
-    private fun trayPieceOrigin(shape: PieceShape, slot: Int): Pair<Float, Float> {
-        val w = shape.cols * trayCell + (shape.cols - 1) * trayGap
-        val h = shape.rows * trayCell + (shape.rows - 1) * trayGap
-        return Pair(slotCenterX[slot] - w / 2f, trayCenterY - h / 2f)
+    /**
+     * Renders one gold block and one dimmed block into bitmaps at slightly above their
+     * on-board size, so every later draw is a downscaled blit instead of three fresh
+     * gradient shaders.
+     */
+    private fun buildBlockArt() {
+        val artW = ceil(cell * 1.2f).toInt()
+        if (artW < 2) return
+        if (artW == blockArtSize && blockArt[0] != null) return
+        blockArtSize = artW
+        val sArt = artW.toFloat()
+        for (style in intArrayOf(0, 3)) {
+            val contentH = if (style == 0) sArt * BLOCK_EDGE else sArt
+            val artH = ceil(contentH).toInt().coerceAtLeast(1)
+            blockArt[style] = try {
+                val bmp = Bitmap.createBitmap(artW, artH, Bitmap.Config.ARGB_8888)
+                drawBlockDirect(Canvas(bmp), 0f, 0f, sArt, style, 255)
+                blockArtRatio[style] = artH / sArt
+                bmp
+            } catch (_: Throwable) {
+                null
+            }
+        }
     }
+
+    /** Cached per-slot "piece still fits somewhere" flag. */
+    private fun trayFits(slot: Int): Boolean {
+        if (trayFitsVersion != game.version) {
+            for (i in 0..2) trayFits[i] = game.canPlaceAnywhere(game.tray[i])
+            trayFitsVersion = game.version
+        }
+        return trayFits[slot]
+    }
+
+    // Returned as separate floats on purpose: Kotlin's Pair<Float, Float> is generic, so
+    // it boxed both coordinates on every one of the 128 calls this used to make per frame.
+    private fun cellX(col: Int): Float = boardLeft + boardPad + col * (cell + gap)
+    private fun cellY(row: Int): Float = boardTop + boardPad + row * (cell + gap)
+
+    private fun trayOriginX(shape: PieceShape, slot: Int): Float =
+        slotCenterX[slot] - (shape.cols * trayCell + (shape.cols - 1) * trayGap) / 2f
+
+    private fun trayOriginY(shape: PieceShape): Float =
+        trayCenterY - (shape.rows * trayCell + (shape.rows - 1) * trayGap) / 2f
 
     // ============================================================ draw
     override fun onDraw(canvas: Canvas) {
@@ -212,23 +288,55 @@ class GameView @JvmOverloads constructor(
         if (busy) postInvalidateOnAnimation()
     }
 
-    private fun drawBackground(canvas: Canvas) {
-        val w = width.toFloat(); val h = height.toFloat()
-        pFill.shader = LinearGradient(0f, 0f, 0f, h,
+    private fun ensureBackground() {
+        if (width == bgW && height == bgH && bgFill != null) return
+        bgW = width; bgH = height
+        if (width <= 0 || height <= 0) return
+        val h = height.toFloat()
+        bgFill = LinearGradient(0f, 0f, 0f, h,
             Color.rgb(0xA8, 0x6A, 0x3D), Color.rgb(0x8B, 0x4D, 0x2A), Shader.TileMode.CLAMP)
-        canvas.drawRect(0f, 0f, w, h, pFill)
-        pFill.shader = RadialGradient(w / 2f, h * 0.32f, h * 0.85f,
+        bgVignette = RadialGradient(width / 2f, h * 0.32f, h * 0.85f,
             intArrayOf(0x00000000, 0x22000000), floatArrayOf(0.55f, 1.0f), Shader.TileMode.CLAMP)
+    }
+
+    private fun drawBackground(canvas: Canvas) {
+        ensureBackground()
+        val w = width.toFloat(); val h = height.toFloat()
+        val fill = bgFill ?: return
+        pFill.shader = fill
+        canvas.drawRect(0f, 0f, w, h, pFill)
+        // The vignette is a full-screen radial gradient — the single most expensive fill
+        // in the app — so it is built once rather than per frame.
+        pFill.shader = bgVignette
         canvas.drawRect(0f, 0f, w, h, pFill)
         pFill.shader = null
     }
 
+    /** The top bar's gradients depend only on width + top inset, so they are cached. */
+    private fun ensureTopBar() {
+        val key = width * 31 + paddingTop
+        if (key == topBarKey && shCrown != null) return
+        topBarKey = key
+        val y = paddingTop + dp(30f)
+        val ch = dp(26f) * 0.78f
+        val ct = y - ch / 2f
+        shCrown = LinearGradient(0f, ct, 0f, ct + ch,
+            Color.rgb(0xFF, 0xD9, 0x4D), Color.rgb(0xE8, 0xA9, 0x21), Shader.TileMode.CLAMP)
+        val gearR = dp(20f)
+        shGear = LinearGradient(0f, y - gearR, 0f, y + gearR,
+            Color.rgb(0xE3, 0xB2, 0x7A), Color.rgb(0xC2, 0x8A, 0x52), Shader.TileMode.CLAMP)
+        val py = y - gearR * 1.18f
+        shPill = LinearGradient(0f, py, 0f, py + dp(20f),
+            Color.rgb(0xF7, 0xB4, 0x3C), Color.rgb(0xE8, 0x8E, 0x1E), Shader.TileMode.CLAMP)
+    }
+
     private fun drawTopBar(canvas: Canvas) {
+        ensureTopBar()
         val y = paddingTop + dp(30f)
         // crown + best
         val crownSize = dp(26f)
         val crownX = dp(18f)
-        drawCrown(canvas, crownX + crownSize / 2f, y, crownSize)
+        drawCrown(canvas, crownX + crownSize / 2f, y, crownSize, shCrown)
         pTextLeft.textSize = dp(19f)
         pTextLeft.typeface = fontBold
         pTextLeft.color = Color.rgb(0xF9, 0xCB, 0x6E)
@@ -240,13 +348,13 @@ class GameView @JvmOverloads constructor(
         val gearR = dp(20f)
         val gx = width - dp(38f)
         gearRect.set(gx - gearR, y - gearR, gx + gearR, y + gearR)
-        drawGear(canvas, gx, y, gearR)
+        drawGear(canvas, gx, y, gearR, shGear)
         // NEW pill
         val pillW = dp(44f); val pillH = dp(20f)
         val px = gx + gearR * 0.18f; val py = y - gearR * 1.18f
-        pFill.shader = LinearGradient(px, py, px, py + pillH,
-            Color.rgb(0xF7, 0xB4, 0x3C), Color.rgb(0xE8, 0x8E, 0x1E), Shader.TileMode.CLAMP)
-        canvas.drawRoundRect(RectF(px, py, px + pillW, py + pillH), pillH / 2f, pillH / 2f, pFill)
+        pFill.shader = shPill
+        tmpRect.set(px, py, px + pillW, py + pillH)
+        canvas.drawRoundRect(tmpRect, pillH / 2f, pillH / 2f, pFill)
         pFill.shader = null
         pText.textSize = dp(11f)
         pText.typeface = fontBold
@@ -267,25 +375,33 @@ class GameView @JvmOverloads constructor(
     private fun drawBoard(canvas: Canvas, now: Long) {
         // frame shadow + frame
         pFill.color = 0x55000000
-        canvas.drawRoundRect(
-            RectF(boardLeft, boardTop + dp(5f), boardLeft + boardSize, boardTop + boardSize + dp(5f)),
-            dp(12f), dp(12f), pFill
-        )
+        tmpRect.set(boardLeft, boardTop + dp(5f), boardLeft + boardSize, boardTop + boardSize + dp(5f))
+        canvas.drawRoundRect(tmpRect, dp(12f), dp(12f), pFill)
         pFill.color = Color.rgb(0x3A, 0x1E, 0x10)
-        canvas.drawRoundRect(RectF(boardLeft, boardTop, boardLeft + boardSize, boardTop + boardSize),
-            dp(12f), dp(12f), pFill)
+        tmpRect.set(boardLeft, boardTop, boardLeft + boardSize, boardTop + boardSize)
+        canvas.drawRoundRect(tmpRect, dp(12f), dp(12f), pFill)
 
-        val clearing = clearAnim?.cells ?: emptyList()
-        val tClear = clearAnim?.let { (now - it.start).toFloat() } ?: 0f
+        val ca = clearAnim
+        val pa = popAnim
+        val tClear = if (ca != null) (now - ca.start).toFloat() else 0f
+
+        // rebuild the per-cell masks once instead of scanning the cell lists 64x below
+        for (r in 0..7) { clearMask[r].fill(false); popMask[r].fill(false) }
+        if (ca != null) for (cc in ca.cells) {
+            if (cc.row in 0..7 && cc.col in 0..7) clearMask[cc.row][cc.col] = true
+        }
+        if (pa != null) for (cc in pa.cells) {
+            if (cc.row in 0..7 && cc.col in 0..7) popMask[cc.row][cc.col] = true
+        }
 
         // empty cells underneath everything
+        pFill.color = Color.rgb(0x4C, 0x2B, 0x1A)
         for (r in 0..7) {
             for (c in 0..7) {
-                val (x, y) = cellOrigin(r, c)
-                if (!game.grid[r][c] && clearing.none { it.row == r && it.col == c }) {
-                    pFill.color = Color.rgb(0x4C, 0x2B, 0x1A)
-                    canvas.drawRoundRect(RectF(x, y, x + cell, y + cell), cell * 0.14f, cell * 0.14f, pFill)
-                }
+                if (game.grid[r][c] || clearMask[r][c]) continue
+                val x = cellX(c); val y = cellY(r)
+                tmpRect.set(x, y, x + cell, y + cell)
+                canvas.drawRoundRect(tmpRect, cell * 0.14f, cell * 0.14f, pFill)
             }
         }
 
@@ -293,10 +409,9 @@ class GameView @JvmOverloads constructor(
         for (r in 0..7) {
             for (c in 0..7) {
                 if (!game.grid[r][c]) continue
-                val (x, y) = cellOrigin(r, c)
-                val pop = popAnim?.cells?.any { it.row == r && it.col == c } == true
-                if (pop) {
-                    val pt = ((now - popAnim!!.start) / 230f).coerceIn(0f, 1f)
+                val x = cellX(c); val y = cellY(r)
+                if (pa != null && popMask[r][c]) {
+                    val pt = ((now - pa.start) / 230f).coerceIn(0f, 1f)
                     val s = popScale(pt)
                     val d = cell * (1f - s) / 2f
                     drawBlock(canvas, x + d, y + d, cell * s, 0, 255)
@@ -307,13 +422,14 @@ class GameView @JvmOverloads constructor(
         }
 
         // cells being cleared: flash white, then shrink away
-        for (cc in clearing) {
-            val (x, y) = cellOrigin(cc.row, cc.col)
+        if (ca != null) for (cc in ca.cells) {
+            val x = cellX(cc.col); val y = cellY(cc.row)
             if (tClear < 150f) {
                 val a = if (tClear < 75f) tClear / 75f else 1f - (tClear - 75f) / 75f
                 drawBlock(canvas, x, y, cell, 0, (255 * (0.45f + 0.55f * a)).toInt().coerceIn(0, 255))
                 pFill.color = Color.argb((a * 170).toInt().coerceIn(0, 255), 0xFF, 0xFF, 0xFF)
-                canvas.drawRoundRect(RectF(x, y, x + cell, y + cell), cell * 0.14f, cell * 0.14f, pFill)
+                tmpRect.set(x, y, x + cell, y + cell)
+                canvas.drawRoundRect(tmpRect, cell * 0.14f, cell * 0.14f, pFill)
             } else {
                 val s = (1f - (tClear - 150f) / 270f).coerceIn(0f, 1f)
                 val d = cell * (1f - s) / 2f
@@ -329,8 +445,7 @@ class GameView @JvmOverloads constructor(
                 val r = anchorRow + cc.row
                 val c = anchorCol + cc.col
                 if (r in 0..7 && c in 0..7) {
-                    val (x, y) = cellOrigin(r, c)
-                    drawBlock(canvas, x, y, cell, style, 255)
+                    drawBlock(canvas, cellX(c), cellY(r), cell, style, 255)
                 }
             }
         }

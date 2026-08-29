@@ -29,9 +29,11 @@ class MainActivity : Activity() {
 
     private fun startGame() {
         val view = GameView(this)
-        // Render the custom canvas with the software pipeline, which is fully
-        // supported on every Android device and avoids vendor GPU driver bugs.
-        view.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+        // Keep the view on the hardware pipeline. LAYER_TYPE_NONE means "no off-screen
+        // layer at all" -- LAYER_TYPE_HARDWARE would still force a full-screen buffer,
+        // and LAYER_TYPE_SOFTWARE (used previously) forced every frame to be rasterized
+        // on the CPU into a full-screen bitmap and re-uploaded to the GPU.
+        view.setLayerType(View.LAYER_TYPE_NONE, null)
         setContentView(view)
         makeFullscreen()
     }

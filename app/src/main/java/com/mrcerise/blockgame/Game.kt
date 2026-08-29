@@ -119,6 +119,15 @@ class Game(val rng: Random = Random.Default) {
     /** The three offered pieces; null = empty slot (waiting for a refill). */
     val tray: Array<PieceShape?> = arrayOfNulls(3)
 
+    /**
+     * Bumped on every grid/tray mutation so views can cache derived state (such as
+     * "does this tray piece still fit anywhere") instead of recomputing it per frame.
+     */
+    var version = 0
+        private set
+
+    private fun touch() { version++ }
+
     init {
         refillTray()
     }
@@ -129,6 +138,7 @@ class Game(val rng: Random = Random.Default) {
         streak = 0
         over = false
         refillTray()
+        touch()
     }
 
     fun refillTray() {
@@ -136,6 +146,7 @@ class Game(val rng: Random = Random.Default) {
             if (tray[i] == null) tray[i] = PiecePool.random(rng)
         }
         over = !anyMovePossible()
+        touch()
     }
 
     fun canPlace(shape: PieceShape, topRow: Int, leftCol: Int): Boolean {
@@ -166,6 +177,7 @@ class Game(val rng: Random = Random.Default) {
 
         for (cell in shape.cells) grid[topRow + cell.row][leftCol + cell.col] = true
         tray[slot] = null
+        touch()
 
         // full rows / columns
         val fullRows = (0 until boardSize).filter { r -> (0 until boardSize).all { c -> grid[r][c] } }
@@ -210,6 +222,7 @@ class Game(val rng: Random = Random.Default) {
         // like the real game, a fresh set of pieces only appears once all three are used
         if (tray.all { it == null }) refillTray()
         else over = !anyMovePossible()
+        touch()
     }
 
     // ---- persistence -----------------------------------------------------
@@ -221,6 +234,7 @@ class Game(val rng: Random = Random.Default) {
     }
 
     fun deserializeGrid(s: String) {
+        touch()
         for (r in 0 until boardSize) grid[r].fill(false)
         s.forEachIndexed { i, ch ->
             if (ch == '1') {
@@ -234,6 +248,7 @@ class Game(val rng: Random = Random.Default) {
     fun serializeTray(): String = tray.joinToString(",") { it?.let { PiecePool.indexOf(it).toString() } ?: "-1" }
 
     fun deserializeTray(s: String) {
+        touch()
         val parts = s.split(",")
         for (i in 0 until 3) {
             tray[i] = parts.getOrNull(i)?.toIntOrNull()?.let { if (it >= 0) PiecePool.byIndex(it) else null }

@@ -33,12 +33,11 @@ jobs:
 
       - name: Build release APK
         env:
+          ORG_GRADLE_PROJECT_RELEASE_STORE_FILE: release.keystore
           ORG_GRADLE_PROJECT_RELEASE_STORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_STORE_PASSWORD }}
           ORG_GRADLE_PROJECT_RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEYSTORE_ALIAS }}
           ORG_GRADLE_PROJECT_RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_KEY_PASSWORD }}
-        run: |
-          ./gradlew assembleRelease --stacktrace \
-            -Pandroid.injected.signing.store.file=app/release.keystore
+        run: ./gradlew assembleRelease --stacktrace
 
       - name: Clean up keystore
         if: always()

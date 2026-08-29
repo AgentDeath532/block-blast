@@ -3,18 +3,21 @@ plugins {
     id 'org.jetbrains.kotlin.android'
 }
 
-
 android {
-    namespace 'com.blockblast.game'
+    namespace 'com.mrcerise.blockgame'
     compileSdk 34
 
     signingConfigs {
         release {
+            storeFile file(project.findProperty('RELEASE_STORE_FILE') ?: 'release.keystore')
+            storePassword project.findProperty('RELEASE_STORE_PASSWORD') ?: ''
+            keyAlias project.findProperty('RELEASE_KEY_ALIAS') ?: ''
+            keyPassword project.findProperty('RELEASE_KEY_PASSWORD') ?: ''
         }
     }
 
     defaultConfig {
-        applicationId "com.blockblast.game"
+        applicationId "com.mrcerise.blockgame"
         minSdk 24
         targetSdk 34
         versionCode 1

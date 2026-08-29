@@ -464,13 +464,14 @@ class GameView @JvmOverloads constructor(
         for (i in 0..2) {
             val shape = game.tray[i] ?: continue
             if (dragSlot == i) continue
-            val (ox, oy) = trayPieceOrigin(shape, i)
+            val ox = trayOriginX(shape, i)
+            val oy = trayOriginY(shape)
             val age = (now - trayBorn[i]).coerceAtLeast(0)
             val appear = (age / 320f).coerceIn(0f, 1f)
             val scale = if (appear < 1f) popScale(appear) else 1f
             val slide = (1f - appear) * dp(18f)
             val alpha = (appear * 255).toInt()
-            val fits = game.canPlaceAnywhere(shape)
+            val fits = trayFits(i)
             canvas.save()
             val cx = slotCenterX[i]
             val cy = oy + (shape.rows * trayCell + (shape.rows - 1) * trayGap) / 2f
@@ -487,19 +488,17 @@ class GameView @JvmOverloads constructor(
     }
 
     /** Top-left (in board/cell metrics) of the piece as it floats above the finger. */
-    private fun boardDragOrigin(shape: PieceShape): Pair<Float, Float> {
-        val w = shape.cols * cell + (shape.cols - 1) * gap
-        val lift = cell * 1.15f
-        val ox = dragX - w / 2f
-        val oy = dragY - lift - shape.rows * (cell + gap)
-        return Pair(ox, oy)
-    }
+    private fun dragOriginX(shape: PieceShape): Float =
+        dragX - (shape.cols * cell + (shape.cols - 1) * gap) / 2f
+
+    private fun dragOriginY(shape: PieceShape): Float =
+        dragY - cell * 1.15f - shape.rows * (cell + gap)
 
     private fun drawDrag(canvas: Canvas) {
         val shape = dragShape ?: return
         if (dragSlot < 0) return
         if (dragOverBoard) {
-            val (ox, oy) = boardDragOrigin(shape)
+            val ox = dragOriginX(shape); val oy = dragOriginY(shape)
             for (cc in shape.cells) {
                 drawBlock(canvas, ox + cc.col * (cell + gap), oy + cc.row * (cell + gap), cell, 0, 235)
             }
@@ -535,28 +534,48 @@ class GameView @JvmOverloads constructor(
     /** style: 0 = gold block, 1 = ghost (valid), 2 = invalid, 3 = dimmed gray */
     private fun drawBlock(canvas: Canvas, x: Float, y: Float, s: Float, style: Int, alpha: Int) {
         if (s <= 0.5f) return
+        // Styles 0 and 3 are the gradient-filled ones and account for nearly every block
+        // drawn, so they come from the pre-rendered bitmaps: one scaled blit instead of
+        // three native shader allocations per block per frame.
+        val art = if (style == 0 || style == 3) blockArt[style] else null
+        if (art != null) {
+            blockRect.set(x, y, x + s, y + s * blockArtRatio[style])
+            pBitmap.alpha = alpha
+            canvas.drawBitmap(art, null, blockRect, pBitmap)
+            return
+        }
+        drawBlockDirect(canvas, x, y, s, style, alpha)
+    }
+
+    /**
+     * The original immediate-mode block renderer. Still used for the ghost/invalid hover
+     * styles (which allocate no shaders anyway) and to render the cached bitmaps above.
+     */
+    private fun drawBlockDirect(canvas: Canvas, x: Float, y: Float, s: Float, style: Int, alpha: Int) {
+        if (s <= 0.5f) return
         val radius = s * 0.15f
-        val rect = RectF(x, y, x + s, y + s)
+        val rect = blockRect
+        rect.set(x, y, x + s, y + s)
         when (style) {
             0 -> {
                 pBlock.shader = LinearGradient(x, y, x, y + s,
                     Color.rgb(0xF2, 0xCE, 0x80), Color.rgb(0xD8, 0xA6, 0x53), Shader.TileMode.CLAMP)
                 pBlock.alpha = alpha
                 canvas.drawRoundRect(rect, radius, radius, pBlock)
-                pBlock.shader = LinearGradient(x, y + s, x, y + s * 1.06f,
-                    Color.rgb(0xA8, 0x72, 0x2E), Color.rgb(0xA8, 0x72, 0x2E), Shader.TileMode.CLAMP)
-                pBlock.alpha = (alpha * 0.9f).toInt()
-                canvas.drawRoundRect(RectF(x, y + s, x + s, y + s * 1.06f), radius * 0.5f, radius * 0.5f, pBlock)
+                // the bottom edge had two identical gradient stops — a flat fill does it
                 pBlock.shader = null
+                pBlock.color = Color.rgb(0xA8, 0x72, 0x2E)
+                pBlock.alpha = (alpha * 0.9f).toInt()
+                tmpRect.set(x, y + s, x + s, y + s * BLOCK_EDGE)
+                canvas.drawRoundRect(tmpRect, radius * 0.5f, radius * 0.5f, pBlock)
                 pBlock.alpha = 255
                 // gloss
                 val inset = s * 0.13f
                 pFill.shader = LinearGradient(x, y, x, y + s * 0.5f,
                     Color.argb((alpha * 0.34f).toInt(), 255, 255, 255), Color.argb(0, 255, 255, 255),
                     Shader.TileMode.CLAMP)
-                canvas.drawRoundRect(
-                    RectF(x + inset, y + inset * 0.9f, x + s - inset, y + s * 0.48f),
-                    radius * 0.7f, radius * 0.7f, pFill)
+                tmpRect.set(x + inset, y + inset * 0.9f, x + s - inset, y + s * 0.48f)
+                canvas.drawRoundRect(tmpRect, radius * 0.7f, radius * 0.7f, pFill)
                 pFill.shader = null
             }
             1 -> {
@@ -584,10 +603,11 @@ class GameView @JvmOverloads constructor(
     }
 
     // ---------------- icons ----------------
-    private fun drawCrown(canvas: Canvas, cx: Float, cy: Float, size: Float) {
+    private fun drawCrown(canvas: Canvas, cx: Float, cy: Float, size: Float, cached: LinearGradient? = null) {
         val w = size; val h = size * 0.78f
         val l = cx - w / 2f; val t = cy - h / 2f
-        val path = Path()
+        val path = scratchPath
+        path.reset()
         path.moveTo(l, t + h * 0.85f)
         path.lineTo(l, t + h * 0.25f)
         path.lineTo(l + w * 0.28f, t + h * 0.55f)
@@ -596,7 +616,7 @@ class GameView @JvmOverloads constructor(
         path.lineTo(l + w, t + h * 0.25f)
         path.lineTo(l + w, t + h * 0.85f)
         path.close()
-        pFill.shader = LinearGradient(0f, t, 0f, t + h,
+        pFill.shader = cached ?: LinearGradient(0f, t, 0f, t + h,
             Color.rgb(0xFF, 0xD9, 0x4D), Color.rgb(0xE8, 0xA9, 0x21), Shader.TileMode.CLAMP)
         canvas.drawPath(path, pFill)
         pFill.shader = null
@@ -608,9 +628,10 @@ class GameView @JvmOverloads constructor(
         canvas.drawCircle(l + w, t + h * 0.22f, w * 0.07f, pFill)
     }
 
-    private fun drawGear(canvas: Canvas, cx: Float, cy: Float, r: Float) {
+    private fun drawGear(canvas: Canvas, cx: Float, cy: Float, r: Float, cached: LinearGradient? = null) {
         val teeth = 8
-        val path = Path()
+        val path = scratchPath
+        path.reset()
         for (i in 0 until teeth * 2) {
             val rr = if (i % 2 == 0) r else r * 0.82f
             val ang = Math.PI * i / teeth
@@ -619,7 +640,7 @@ class GameView @JvmOverloads constructor(
             if (i == 0) path.moveTo(px, py) else path.lineTo(px, py)
         }
         path.close()
-        pFill.shader = LinearGradient(0f, cy - r, 0f, cy + r,
+        pFill.shader = cached ?: LinearGradient(0f, cy - r, 0f, cy + r,
             Color.rgb(0xE3, 0xB2, 0x7A), Color.rgb(0xC2, 0x8A, 0x52), Shader.TileMode.CLAMP)
         canvas.drawPath(path, pFill)
         pFill.shader = null
@@ -846,7 +867,7 @@ class GameView @JvmOverloads constructor(
         // decide board-mode by whether the floating piece (lifted above the finger)
         // overlaps the board — this lets pieces reach the bottom row even though the
         // finger itself drops below the board frame
-        val (ox, oy) = boardDragOrigin(shape)
+        val ox = dragOriginX(shape); val oy = dragOriginY(shape)
         val pieceW = shape.cols * cell + (shape.cols - 1) * gap
         val pieceH = shape.rows * cell + (shape.rows - 1) * gap
         val m = cell
@@ -929,6 +950,11 @@ class GameView @JvmOverloads constructor(
         } catch (_: Throwable) {
             try { performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY) } catch (_: Throwable) {}
         }
+    }
+
+    private companion object {
+        /** Blocks render a thin lip below the body: total height is size * BLOCK_EDGE. */
+        const val BLOCK_EDGE = 1.06f
     }
 
     // ============================================================ persistence

@@ -1,0 +1,62 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.blockblast.game.app-merged_res-4:/values_values.arsc.flat",
+            "map": [
+                {
+                    "source": "/home/zoom/Projects/BlockBlast/app/src/main/res/values/themes.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "102",
+                        "endLines": "7",
+                        "endColumns": "12",
+                        "endOffsets": "489"
+                    },
+                    "to": {
+                        "startLines": "5",
+                        "startColumns": "4",
+                        "startOffsets": "226",
+                        "endLines": "10",
+                        "endColumns": "12",
+                        "endOffsets": "611"
+                    }
+                },
+                {
+                    "source": "/home/zoom/Projects/BlockBlast/app/src/main/res/values/colors.xml",
+                    "from": {
+                        "startLines": "2,3",
+                        "startColumns": "4,4",
+                        "startOffsets": "55,92",
+                        "endColumns": "36,39",
+                        "endOffsets": "87,127"
+                    },
+                    "to": {
+                        "startLines": "2,3",
+                        "startColumns": "4,4",
+                        "startOffsets": "100,137",
+                        "endColumns": "36,39",
+                        "endOffsets": "132,172"
+                    }
+                },
+                {
+                    "source": "/home/zoom/Projects/BlockBlast/app/src/main/res/values/strings.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endColumns": "48",
+                        "endOffsets": "99"
+                    },
+                    "to": {
+                        "startLines": "4",
+                        "startColumns": "4",
+                        "startOffsets": "177",
+                        "endColumns": "48",
+                        "endOffsets": "221"
+                    }
+                }
+            ]
+        }
+    ]
+}

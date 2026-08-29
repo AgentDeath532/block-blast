@@ -593,6 +593,8 @@ class GameView @JvmOverloads constructor(
                 canvas.drawRoundRect(rect, radius, radius, pStroke)
             }
             3 -> {
+                // the shader already carries `alpha`, so the paint must not scale it again
+                pBlock.alpha = 255
                 pBlock.shader = LinearGradient(x, y, x, y + s,
                     Color.argb(alpha, 0x9B, 0x8B, 0x76), Color.argb(alpha, 0x66, 0x59, 0x48),
                     Shader.TileMode.CLAMP)

@@ -2,3 +2,5 @@
 *.jks
 keystore.properties
 local.properties
+app/release.keystore
+keystore.b64

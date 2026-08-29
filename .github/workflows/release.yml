@@ -35,7 +35,7 @@ jobs:
       - name: Debug secret length
         env:
           KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
-        run: echo "Length: ${#KEYSTORE_BASE64}"
+        run: 'echo "Length: ${#KEYSTORE_BASE64}"'
 
       - name: Decode keystore
         env:
